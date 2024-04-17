@@ -1,0 +1,118 @@
+---
+- hosts: targets
+  become: yes
+  tasks:
+    - name: Install Apache
+      apt:
+        update_cache: yes
+        name: apache2
+        state: present
+
+    - name: Add web application files
+      copy:
+        content: |
+          <html>
+          <head>
+          <title>Hello World</title>
+          </head>
+          <body>
+          <h1>Hello World!</h1>
+          </body>
+          </html>
+        dest: /var/www/html/index.html
+        owner: www-data
+        group: www-data
+        mode: '0644'
+
+    - name: Configure UFW firewall to allow traffic on ports 443 and 80
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+      loop:
+        - 443
+        - 80
+        - 22
+
+    - name: Enable UFW firewall
+      ufw:
+        state: enabled
+
+    - name: Remove existing content from 000-default.conf
+      lineinfile:
+        path: /etc/apache2/sites-available/000-default.conf
+        state: absent
+        regexp: '.*'
+
+
+    - name: Create private key (RSA, 4096 bits)
+      openssl_privatekey:
+        path: /opt/certificate.key
+
+    - name: Create simple self-signed certificate
+      community.crypto.x509_certificate:
+        path: /opt/certificate.pem
+        privatekey_path: /opt/certificate.key
+        provider: selfsigned
+
+    - name: Configure Apache virtual host for ports 80 and 443
+      blockinfile:
+        path: /etc/apache2/sites-available/000-default.conf
+        block: |
+          <VirtualHost *:80>
+              ServerName {{ ansible_host }}
+              Redirect permanent / https://{{ ansible_host }}/
+          </VirtualHost>
+
+          <VirtualHost *:443>
+              ServerName {{ ansible_host }}
+              SSLEngine On
+              SSLCertificateFile /opt/certificate.pem
+              SSLCertificateKeyFile /opt/certificate.key
+              DocumentRoot /var/www/html
+          </VirtualHost>
+        backup: yes
+
+    - name: Enable mod_ssl
+      command: a2enmod ssl
+      args:
+        creates: /etc/apache2/mods-enabled/ssl.conf
+
+    - name: Restart Apache
+      service:
+        name: apache2
+        state: restarted
+
+    - name: Check SSL configuration
+      shell: |
+        openssl s_client -connect {{ ansible_host }}:443 -showcerts < /dev/null
+      register: ssl_cert_output
+      ignore_errors: true
+
+    - name: Fail if SSL certificate is not valid
+      fail:
+        msg: "SSL certificate is not valid"
+      when: "'Certificate chain' not in ssl_cert_output.stdout"
+
+    - name: Show message if SSL certificate is valid
+      debug:
+        msg: "SSL certificate is valid"
+      when: "'Certificate chain' in ssl_cert_output.stdout"
+
+    - name: Make request on port 80 HTTP
+      uri:
+        url: "http://{{ ansible_host }}"
+        validate_certs: no
+      register: response
+      ignore_errors: true
+
+    - name: Fail if request not redirected
+      fail:
+        msg: "The URL did not redirect"
+      when: not response.redirected
+
+    - name: Show message if request is redirected
+      debug:
+        msg: "The URL is redirected"
+      when: response.redirected
+
+
